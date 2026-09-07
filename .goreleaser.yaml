@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=jcroql
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: argo9s
+    main: ./cmd/argo9s
+    binary: argo9s
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.FullCommit}}
+      - -X main.buildDate={{.Date}}
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+brews:
+  - repository:
+      owner: vvrnv
+      name: homebrew-tap
+    directory: Formula
+    homepage: https://github.com/vvrnv/argo9s
+    description: K9s-inspired terminal UI for Argo CD
+    license: MIT
+    commit_author:
+      name: vvrnv
+      email: valeravoronov96@gmail.com
+    install: |
+      bin.install "argo9s"
+    test: |
+      assert_match "argo9s", shell_output("#{bin}/argo9s version")

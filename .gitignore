@@ -1,0 +1,25 @@
+# Binaries
+/argo9s
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Go
+vendor/
+coverage.out
+coverage.html
+
+# Local config / secrets
+kubeconfig
+*.kubeconfig
+.env
+.env.*
