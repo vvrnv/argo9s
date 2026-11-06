@@ -17,8 +17,8 @@ func TestBuildAppGraph(t *testing.T) {
 			"namespace": "argocd",
 		},
 		"spec": map[string]any{
-			"project": "default",
-			"source":  map[string]any{"repoURL": "https://example.com/repo"},
+			"project":     "default",
+			"source":      map[string]any{"repoURL": "https://example.com/repo"},
 			"destination": map[string]any{"namespace": "demo"},
 		},
 		"status": map[string]any{
