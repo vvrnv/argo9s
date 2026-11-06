@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
@@ -24,15 +25,15 @@ const (
 
 // Session is a resolved connection ready for the TUI.
 type Session struct {
-	Name    string
-	Type    string // kubernetes | argocd | demo
-	Label   string // header context string
-	Cfg     config.Config
-	Kube    *kube.Client
-	Argo    *argocd.Client
-	Store   *argo.Store
-	Ops     argo.Mutator
-	Conn    config.Connection
+	Name  string
+	Type  string // kubernetes | argocd | demo
+	Label string // header context string
+	Cfg   config.Config
+	Kube  *kube.Client
+	Argo  *argocd.Client
+	Store *argo.Store
+	Ops   argo.Mutator
+	Conn  config.Connection
 }
 
 func Open(ctx context.Context, cfg config.Config, conn config.Connection, kubeContextFlag string, timeout time.Duration) (*Session, error) {
@@ -163,6 +164,8 @@ func (s *Session) StreamPodLogs(ctx context.Context, app argo.Resource, podNS, p
 		return fmt.Errorf("nil emit")
 	}
 	switch s.Type {
+	case TypeDemo:
+		return demoLogs(podName, container, emit)
 	case config.ConnArgoCD:
 		if s.Argo == nil {
 			return fmt.Errorf("argocd client not configured")
@@ -318,6 +321,73 @@ func (s *Session) destinationClient(ctx context.Context, app argo.Resource) *kub
 	return s.Kube
 }
 
+// ContainerInfo is one container of a pod, for the logs / shell picker.
+type ContainerInfo struct {
+	Name, Image, State string
+	Ready              bool
+	Restarts           int32
+}
+
+// PodContainers lists a pod's containers (default-container annotation first).
+// It reads the live Pod manifest, so it works for both backends.
+func (s *Session) PodContainers(ctx context.Context, app argo.Resource, ns, pod string) ([]ContainerInfo, error) {
+	if s.Type == TypeDemo { // offline demo: every pod runs an app + a sidecar
+		return []ContainerInfo{
+			{Name: "app", Image: "ghcr.io/example/" + app.Name + ":1.4.2", State: "running", Ready: true},
+			{Name: "envoy", Image: "envoyproxy/envoy:v1.31", State: "running", Ready: true, Restarts: 1},
+		}, nil
+	}
+	text, err := s.GetResourceYAML(ctx, app, ResourceRef{Version: "v1", Kind: "Pod", Namespace: ns, Name: pod})
+	if err != nil {
+		return nil, err
+	}
+	return containersFromPodYAML(text, ns, pod)
+}
+
+func containersFromPodYAML(text, ns, pod string) ([]ContainerInfo, error) {
+	var p corev1.Pod
+	if err := yaml.Unmarshal([]byte(text), &p); err != nil {
+		return nil, fmt.Errorf("parse pod %s/%s: %w", ns, pod, err)
+	}
+	status := map[string]corev1.ContainerStatus{}
+	for _, cs := range p.Status.ContainerStatuses {
+		status[cs.Name] = cs
+	}
+	def := p.Annotations["kubectl.kubernetes.io/default-container"]
+	var out []ContainerInfo
+	for _, c := range p.Spec.Containers {
+		cs := status[c.Name]
+		state := "waiting"
+		switch {
+		case cs.State.Running != nil:
+			state = "running"
+		case cs.State.Terminated != nil:
+			state = "terminated: " + cs.State.Terminated.Reason
+		case cs.State.Waiting != nil && cs.State.Waiting.Reason != "":
+			state = cs.State.Waiting.Reason
+		}
+		ci := ContainerInfo{Name: c.Name, Image: c.Image, State: state, Ready: cs.Ready, Restarts: cs.RestartCount}
+		if c.Name == def {
+			out = append([]ContainerInfo{ci}, out...)
+		} else {
+			out = append(out, ci)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("pod %s/%s has no containers", ns, pod)
+	}
+	return out, nil
+}
+
+// PodShell opens an interactive shell in a pod (kubernetes connections only:
+// the Argo CD API terminal needs exec.enabled server-side and isn't wired yet).
+func (s *Session) PodShell(ctx context.Context, app argo.Resource, ns, pod, container string) (*kube.PodShell, error) {
+	if s.Type != config.ConnKubernetes || s.Kube == nil {
+		return nil, fmt.Errorf("shell needs a kubernetes connection (not available over the Argo CD API yet)")
+	}
+	return s.destinationClient(ctx, app).PodShell(ns, pod, container), nil
+}
+
 func defaultGVK(kind string) (group, version string) {
 	switch strings.ToLower(kind) {
 	case "pod", "service", "configmap", "secret", "persistentvolumeclaim", "serviceaccount":
@@ -333,4 +403,43 @@ func defaultGVK(kind string) (group, version string) {
 	default:
 		return "", "v1"
 	}
+}
+
+// demoLogs emits plausible access logs for --demo screenshots (no cluster).
+func demoLogs(pod, container string, emit func(string) error) error {
+	paths := []string{"/healthz", "/api/v1/orders", "/api/v1/users/42", "/readyz", "/api/v1/cart"}
+	codes := []int{200, 200, 201, 200, 404, 200, 500, 200}
+	base := time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 60; i++ {
+		line := fmt.Sprintf("%s %s %s %s %d %dms", base.Add(time.Duration(i)*1300*time.Millisecond).Format(time.RFC3339),
+			container, []string{"GET", "POST"}[i%2], paths[i%len(paths)], codes[i%len(codes)], 3+i%40)
+		if err := emit(line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Versions returns the Argo CD version and, on kubernetes connections, the
+// Kubernetes API version. Empty strings when unknown (never fatal).
+func (s *Session) Versions(ctx context.Context) (argoVer, k8sVer string) {
+	switch s.Type {
+	case TypeDemo:
+		return "v2.13.1", "v1.31.2"
+	case config.ConnArgoCD:
+		if s.Argo != nil {
+			argoVer, _ = s.Argo.Version(ctx)
+		}
+	default:
+		if s.Kube == nil {
+			return "", ""
+		}
+		ns := s.Cfg.Namespace
+		if ns == "" || ns == "all" {
+			ns = "argocd"
+		}
+		argoVer, _ = s.Kube.ArgoCDVersion(ctx, ns)
+		k8sVer, _ = s.Kube.ServerVersion()
+	}
+	return argoVer, k8sVer
 }
