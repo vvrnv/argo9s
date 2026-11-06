@@ -520,3 +520,18 @@ func nestedString(m map[string]any, path ...string) (string, bool) {
 	s, ok := cur.(string)
 	return s, ok
 }
+
+// Version returns the Argo CD server version (GET /api/version, no auth needed).
+func (c *Client) Version(ctx context.Context) (string, error) {
+	body, err := c.do(ctx, http.MethodGet, "/api/version", nil, nil)
+	if err != nil {
+		return "", err
+	}
+	var v struct {
+		Version string `json:"Version"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return "", err
+	}
+	return strings.SplitN(v.Version, "+", 2)[0], nil // drop the "+commit" suffix
+}

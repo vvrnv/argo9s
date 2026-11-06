@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -15,7 +17,6 @@ import (
 	"github.com/vvrnv/argo9s/internal/argo"
 	"github.com/vvrnv/argo9s/internal/argocd"
 	"github.com/vvrnv/argo9s/internal/config"
-	"github.com/vvrnv/argo9s/internal/kube"
 	"github.com/vvrnv/argo9s/internal/session"
 )
 
@@ -29,9 +30,11 @@ const (
 	viewHelp
 	viewConfirm
 	viewLogs
+	viewTree       // managed resources of an Application, expandable
+	viewContainers // container picker for pod logs / shell
 )
 
-const appVersion = "v0.1.0"
+const appVersion = "v0.2.0"
 
 type sortCol int
 
@@ -85,11 +88,13 @@ type Model struct {
 	commanding bool
 	cmdIn      textinput.Model
 
-	status     string
-	statusErr  bool
-	selected   argo.Resource
-	detailText string
-	vp         viewport.Model
+	status      string
+	statusErr   bool
+	selected    argo.Resource
+	detailText  string
+	detailTitle string // overrides the describe title (tree node describe)
+	textFilter  string // "/" filter inside logs / yaml / describe
+	vp          viewport.Model
 
 	graph       argo.Graph
 	graphCursor int
@@ -114,10 +119,69 @@ type Model struct {
 	confirmTarget argo.Resource
 
 	quitting bool
+
+	// drill: enter on an appset / project / cluster lists its Applications (k9s-style).
+	expanded        map[string]bool // tree view: expanded node IDs
+	gl              graphLayout     // fullscreen graph layout (cells)
+	gox, goy        int             // graph scroll offset
+	graphQuery      string          // "/" search in the graph
+	graphFull       argo.Graph      // unfiltered graph; m.graph is what is shown
+	showOldRS       bool            // o: show ReplicaSets scaled to 0 (old rollouts)
+	hiddenRS        int
+	containers      []session.ContainerInfo
+	containerCursor int
+	containerAction string // "logs" | "shell" — what enter does in the picker
+	podContainer    string // container used by the current logs stream
+	drill           *argo.Resource
+	drillPrevKind   argo.Kind
+	drillPrevCursor int
+	switchTo        string // connection chosen in :ctx; Run reopens the session with it
+
+	argoVersion, k8sVersion string // shown in the header, fetched once at start
+
+	loading   string // non-empty while an async load/op runs; drives the footer progress bar
+	loadStart time.Time
+	spin      int
+}
+
+type spinMsg struct{}
+type versionsMsg struct{ argo, k8s string }
+type appsLoadedMsg struct {
+	n   int
+	err error
+}
+
+// startLoading marks an async load; returns the animation tick only if none is running yet.
+func (m *Model) startLoading(what string) tea.Cmd {
+	wasIdle := m.loading == ""
+	m.loading, m.loadStart = what, time.Now()
+	if !wasIdle {
+		return nil
+	}
+	return spinTick()
+}
+
+func spinTick() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return spinMsg{} })
+}
+
+// progressBar is an indeterminate bar (a block bouncing in a track) — we can't know
+// how many clusters/objects Argo CD will walk, so no percentage.
+func progressBar(frame, width int) string {
+	const block = 6
+	span := width - block
+	pos := frame % (2 * span)
+	if pos > span {
+		pos = 2*span - pos
+	}
+	track := lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	fill := lipgloss.NewStyle().Foreground(colAqua)
+	return track.Render(strings.Repeat("━", pos)) + fill.Render(strings.Repeat("━", block)) + track.Render(strings.Repeat("━", span-pos))
 }
 
 func New(cfg config.Config, sess *session.Session, events <-chan argo.Event, cancel context.CancelFunc) Model {
 	fi := textinput.New()
+	fi.Prompt = ""
 	fi.Placeholder = "filter…  (:name / :project / :sync)"
 	fi.CharLimit = 128
 	fi.Width = 50
@@ -150,7 +214,7 @@ func New(cfg config.Config, sess *session.Session, events <-chan argo.Event, can
 		ops:        sess.Ops,
 		events:     events,
 		cancel:     cancel,
-		filterKind: argo.KindAll,
+		filterKind: argo.KindApplication, // apps are the base object, like pods in k9s
 		namespace:  ns,
 		allNS:      allNS,
 		context:    label,
@@ -162,7 +226,45 @@ func New(cfg config.Config, sess *session.Session, events <-chan argo.Event, can
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(waitEvent(m.events), tick())
+	cmds := []tea.Cmd{waitEvent(m.events), tick()}
+	if m.session != nil {
+		sess := m.session
+		cmds = append(cmds, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			a, k := sess.Versions(ctx)
+			return versionsMsg{argo: a, k8s: k}
+		})
+	}
+	if m.loading != "" {
+		cmds = append(cmds, spinTick(), preloadApps(m.session))
+	}
+	return tea.Batch(cmds...)
+}
+
+// preloadApps lists Argo CD apps once so the table fills before the poller's first round.
+func preloadApps(sess *session.Session) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		apps, err := sess.Argo.ListApplications(ctx)
+		if err != nil {
+			return appsLoadedMsg{err: fmt.Errorf("list applications: %w", err)}
+		}
+		named := 0
+		for _, app := range apps {
+			r := argocd.ResourceFromAppMap(app)
+			if r.Name == "" {
+				continue
+			}
+			sess.Store.Upsert(r)
+			named++
+		}
+		if len(apps) > 0 && named == 0 {
+			return appsLoadedMsg{err: fmt.Errorf("parsed 0/%d application names (%s)", len(apps), argocd.SampleAppDiag(apps))}
+		}
+		return appsLoadedMsg{n: named}
+	}
 }
 
 func waitEvent(ch <-chan argo.Event) tea.Cmd {
@@ -196,7 +298,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.vp.Width = max(10, msg.Width-2)
-		m.vp.Height = max(5, msg.Height-16)
+		m.vp.Height = m.innerHeight()
 		if m.mode == viewGraph {
 			m.syncGraphViewport()
 		}
@@ -205,6 +307,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.refreshList()
 		return m, tick()
+
+	case podContainersMsg:
+		return m.handlePodContainers(msg)
+
+	case versionsMsg:
+		m.argoVersion, m.k8sVersion = msg.argo, msg.k8s
+		return m, nil
+
+	case spinMsg:
+		if m.loading == "" {
+			return m, nil
+		}
+		m.spin++
+		return m, spinTick()
+
+	case appsLoadedMsg:
+		m.loading = ""
+		m.refreshList()
+		switch {
+		case msg.err != nil:
+			m.status, m.statusErr = msg.err.Error(), true
+		case len(m.resources) > 0:
+			m.status, m.statusErr = fmt.Sprintf("loaded %d resources (store=%d)", len(m.resources), m.store.Len()), false
+		default:
+			m.status, m.statusErr = fmt.Sprintf("no resources in view (store=%d) — try :ns all", m.store.Len()), true
+		}
+		return m, nil
 
 	case resourceEventMsg:
 		ev := argo.Event(msg)
@@ -220,8 +349,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusErr = true
 			}
 		} else {
-			m.statusErr = false
-			m.status = fmt.Sprintf("%s %s/%s", ev.Type, ev.Resource.Kind, ev.Resource.Name)
+			// Argo CD rewrites app status on every reconcile; flashing each event is noise (k9s doesn't).
 			m.refreshList()
 		}
 		return m, waitEvent(m.events)
@@ -230,7 +358,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleLogMsg(msg)
 
 	case yamlLoadedMsg:
+		m.loading = ""
 		m.detailText = msg.text
+		m.detailTitle = msg.ref.Kind + "/" + msg.ref.Name
 		m.yamlRef = msg.ref
 		m.yamlX = 0
 		m.syncYAMLViewport()
@@ -254,6 +384,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.applyEditedYAML(msg.path)
 
 	case opDoneMsg:
+		m.loading = ""
 		if msg.err != nil {
 			m.status = msg.err.Error()
 			m.statusErr = true
@@ -264,21 +395,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case graphReadyMsg:
+		m.loading = ""
 		if msg.err != nil {
 			m.status = "graph: " + msg.err.Error()
 			m.statusErr = true
 			// Still show whatever tree we have (managed resources without live children).
-			m.graph = msg.graph
+			m.setGraph(msg.graph)
 			if m.mode == viewGraph {
 				m.syncGraphViewport()
 			}
 		} else {
-			m.graph = msg.graph
+			m.setGraph(msg.graph)
 			if m.graphCursor >= len(m.graph.Nodes) {
 				m.graphCursor = max(0, len(m.graph.Nodes)-1)
 			}
-			if m.mode == viewGraph {
-				m.syncGraphViewport()
+			if m.mode == viewTree {
+				m.clampTreeCursor()
+			}
+			if m.mode == viewGraph || m.mode == viewTree {
+				if m.mode == viewGraph {
+					m.syncGraphViewport()
+				}
 				children := 0
 				for _, n := range m.graph.Nodes {
 					if n.Depth >= 2 {
@@ -302,6 +439,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.quitting {
 		return m, tea.Quit
 	}
+	if msg.String() == "ctrl+c" { // quits from any view or prompt, like k9s
+		m.quitting = true
+		m.stopLogs()
+		if m.cancel != nil {
+			m.cancel()
+		}
+		return m, tea.Quit
+	}
 
 	if m.mode == viewConfirm {
 		switch msg.String() {
@@ -321,21 +466,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.filtering = false
 			m.filterIn.Blur()
-			m.filter = ""
 			m.filterIn.SetValue("")
-			m.refreshList()
+			m.setFilter("")
 			return m, nil
 		case "enter":
 			m.filtering = false
 			m.filterIn.Blur()
-			m.filter = m.filterIn.Value()
-			m.refreshList()
+			m.setFilter(m.filterIn.Value())
 			return m, nil
 		default:
 			var cmd tea.Cmd
 			m.filterIn, cmd = m.filterIn.Update(msg)
-			m.filter = m.filterIn.Value()
-			m.refreshList()
+			m.setFilter(m.filterIn.Value())
 			return m, cmd
 		}
 	}
@@ -360,13 +502,91 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if m.mode == viewHelp || m.mode == viewDetail || m.mode == viewYAML || m.mode == viewGraph || m.mode == viewLogs {
+	if capsLockSuspect(msg.String()) {
+		m.status, m.statusErr = "⇪ Caps Lock seems on — argo9s keys are lowercase (j k d y l …)", true
+		return m, nil
+	}
+	if m.mode == viewTree {
+		if mm, cmd, ok := m.handleTreeKey(msg); ok {
+			return mm, cmd
+		}
+	}
+	if m.mode == viewContainers {
+		if mm, cmd, ok := m.handleContainersKey(msg); ok {
+			return mm, cmd
+		}
+	}
+	if m.mode == viewGraph && len(m.graph.Nodes) > 0 {
+		switch msg.String() {
+		case "tab", "shift+tab":
+			dir := 1
+			if msg.String() == "shift+tab" {
+				dir = -1
+			}
+			if next := nextIssue(m.graph.Nodes, m.graphCursor, dir); next != m.graphCursor {
+				m.graphCursor = next
+				m.followCursor()
+			} else {
+				m.status, m.statusErr = "no unhealthy / out-of-sync node", false
+			}
+			return m, nil
+		case "s":
+			return m.podAction("shell")
+		case "o":
+			m.toggleOldRS()
+			return m, nil
+		case "/":
+			m.filtering = true
+			m.filterIn.SetValue(m.graphQuery)
+			m.filterIn.Focus()
+			return m, nil
+		case "n", "N":
+			if ms := graphMatches(m.graph, m.gl, m.graphQuery); len(ms) > 0 {
+				m.graphCursor = cycleMatch(ms, m.graphCursor, msg.String() == "n")
+				m.followCursor()
+			}
+			return m, nil
+		case "esc":
+			if m.graphQuery != "" { // k9s: esc drops the search before leaving
+				m.graphQuery = ""
+				m.filterIn.SetValue("")
+				return m, nil
+			}
+		case "pgdown", "ctrl+f", "pgup", "ctrl+b", "home", "end":
+			_, vh := m.graphViewport()
+			m.graphCursor = graphColumnJump(m.graph, m.gl, m.graphCursor, msg.String(), vh)
+			m.followCursor()
+			return m, nil
+		case "l", "right", "j", "down", "k", "up":
+			k := msg.String()
+			if (k == "l") && strings.EqualFold(m.graph.Nodes[m.graphCursor].Kind, "Pod") {
+				return m.openPodLogs()
+			}
+			dir := map[string]string{"l": "child", "right": "child", "j": "down", "down": "down", "k": "up", "up": "up"}[k]
+			m.graphCursor = graphStep(m.graph, m.gl, m.graphCursor, dir)
+			m.followCursor()
+			m.statusErr = false // moving on dismisses the last error
+			return m, nil
+		}
+	}
+	if m.mode == viewHelp || m.mode == viewDetail || m.mode == viewYAML || m.mode == viewGraph || m.mode == viewLogs || m.mode == viewTree || m.mode == viewContainers {
 		switch msg.String() {
 		case "q", "esc", "backspace":
+			if m.textFilter != "" && msg.String() == "esc" { // k9s: esc clears the filter first
+				m.setFilter("")
+				return m, nil
+			}
 			if m.mode == viewLogs {
 				m.stopLogs()
 			}
 			m.popView()
+			return m, nil
+		case "/":
+			if m.mode == viewLogs || m.mode == viewYAML || m.mode == viewDetail {
+				m.filtering = true
+				m.filterIn.SetValue(m.textFilter)
+				m.filterIn.Focus()
+			}
 			return m, nil
 		case "j", "down":
 			if m.mode == viewGraph {
@@ -456,7 +676,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.startPodLogs(!m.logPrevious)
 			}
 			return m, nil
-		case "g":
+		case "pgdown", "ctrl+f":
+			m.vp.PageDown()
+			return m, nil
+		case "pgup", "ctrl+b":
+			m.vp.PageUp()
+			return m, nil
+		case "g", "home":
 			if m.mode == viewGraph {
 				m.graphCursor = 0
 				m.syncGraphViewport()
@@ -464,7 +690,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.vp.GotoTop()
 			return m, nil
-		case "G":
+		case "G", "end":
 			if m.mode == viewGraph {
 				if len(m.graph.Nodes) > 0 {
 					m.graphCursor = len(m.graph.Nodes) - 1
@@ -476,10 +702,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter", "d":
 			if m.mode == viewGraph && len(m.graph.Nodes) > 0 {
-				m.detailText = argo.Describe(m.selected) + "\n\n" + graphNodeSummary(m.graph.Nodes[m.graphCursor])
-				m.vp.SetContent(m.detailText)
-				m.vp.GotoTop()
-				m.pushView(viewDetail)
+				if m.graphCursor == 0 { // the app itself: full describe
+					m.showDetail("", m.describeText(m.selected))
+				} else {
+					n := m.graph.Nodes[m.graphCursor]
+					m.showDetail(n.Kind+"/"+n.Name, nodeDescribe(n, m.selected))
+				}
+				return m, nil
 			}
 			return m, nil
 		case "y":
@@ -523,6 +752,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Quit
 	case "q", "esc":
+		if m.filter != "" && msg.String() == "esc" { // k9s: esc drops the active filter
+			m.filterIn.SetValue("")
+			m.setFilter("")
+			return m, nil
+		}
+		if m.drill != nil { // then leaves the drill-down
+			m.drillBack()
+			return m, nil
+		}
 		m.status = "press Q or :q to quit"
 		return m, nil
 	case "?":
@@ -553,6 +791,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "home", "ctrl+a":
 		m.cursor = 0
 		return m, nil
+	case "pgdown", "ctrl+f":
+		m.cursor = min(max(0, len(m.resources)-1), m.cursor+m.innerHeight()-1)
+		return m, nil
+	case "pgup", "ctrl+b":
+		m.cursor = max(0, m.cursor-(m.innerHeight()-1))
+		return m, nil
 	case "G", "end":
 		if len(m.resources) > 0 {
 			m.cursor = len(m.resources) - 1
@@ -560,13 +804,31 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "g":
 		return m.openGraph()
-	case "enter", "d":
+	case "enter":
+		r, ok := m.current()
+		if !ok {
+			return m, nil
+		}
+		switch r.Kind {
+		case argo.KindApplication:
+			return m.openTree()
+		case argo.KindContext:
+			if m.session != nil && r.Name == m.session.Name {
+				m.status = "already on " + r.Name
+				return m, nil
+			}
+			m.switchTo = r.Name
+			m.quitting = true
+			m.stopLogs()
+			return m, tea.Quit
+		default:
+			m.drillInto(r)
+		}
+		return m, nil
+	case "d":
 		if r, ok := m.current(); ok {
 			m.selected = r
-			m.detailText = argo.Describe(r)
-			m.vp.SetContent(m.detailText)
-			m.vp.GotoTop()
-			m.pushView(viewDetail)
+			m.showDetail("", m.describeText(r))
 		}
 		return m, nil
 	case "y":
@@ -578,9 +840,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.selected = r
-			m.vp.SetContent(text)
-			m.vp.GotoTop()
+			m.detailText, m.detailTitle, m.yamlX = text, "", 0
 			m.pushView(viewYAML)
+			m.syncYAMLViewport()
+			m.vp.GotoTop()
 		}
 		return m, nil
 	case "R":
@@ -662,7 +925,7 @@ func (m Model) withCurrentApp(fn func(argo.Resource) tea.Cmd) (tea.Model, tea.Cm
 		m.statusErr = true
 		return m, nil
 	}
-	return m, fn(r)
+	return m, tea.Batch(m.startLoading(fmt.Sprintf("working on %s", r.Name)), fn(r))
 }
 
 func (m *Model) pushView(next viewMode) {
@@ -674,6 +937,7 @@ func (m *Model) pushView(next viewMode) {
 }
 
 func (m *Model) popView() {
+	m.textFilter = ""
 	if m.mode == viewLogs {
 		m.stopLogs()
 	}
@@ -689,13 +953,19 @@ func (m *Model) popView() {
 		m.syncGraphViewport()
 		m.status = fmt.Sprintf("graph: %s/%s (%d nodes)", m.selected.Namespace, m.selected.Name, len(m.graph.Nodes))
 		m.statusErr = false
+	case viewTree:
+		m.status, m.statusErr = fmt.Sprintf("%s/%s", m.selected.Namespace, m.selected.Name), false
 	case viewList:
-		m.status = "list"
-		m.statusErr = false
+		m.status, m.statusErr = "", false
 	}
 }
 
-func (m Model) openGraph() (tea.Model, tea.Cmd) {
+func (m Model) openGraph() (tea.Model, tea.Cmd) { return m.openApp(viewGraph) }
+func (m Model) openTree() (tea.Model, tea.Cmd)  { return m.openApp(viewTree) }
+
+// openApp shows the selected Application's resources as a box graph or a tree,
+// then enriches it with live children (rs/pods) asynchronously.
+func (m Model) openApp(mode viewMode) (tea.Model, tea.Cmd) {
 	r, ok := m.current()
 	if !ok {
 		return m, nil
@@ -709,16 +979,27 @@ func (m Model) openGraph() (tea.Model, tea.Cmd) {
 		r = fresh
 	}
 	m.selected = r
-	m.graph = argo.BuildAppGraph(r)
+	m.graphFull = argo.Graph{} // new app: don't carry the previous cursor over
+	m.setGraph(argo.BuildAppGraph(r))
 	m.graphCursor = 0
-	m.pushView(viewGraph)
-	m.syncGraphViewport()
+	if mode == viewGraph && m.width > 0 && m.width < 100 {
+		mode = viewTree // boxes are unreadable on narrow terminals; the tree isn't
+	}
+	m.gox, m.goy = 0, 0
+	m.pushView(mode)
+	if mode == viewTree {
+		m.expanded = map[string]bool{}
+		m.clampTreeCursor()
+	} else {
+		m.syncGraphViewport()
+	}
 	m.status = fmt.Sprintf("graph: %s/%s — loading pods…", r.Namespace, r.Name)
 	m.statusErr = false
 
 	client := m.session
 	base := m.graph
-	return m, func() tea.Msg {
+	spin := m.startLoading(fmt.Sprintf("loading graph %s/%s (walking clusters)", r.Namespace, r.Name))
+	return m, tea.Batch(spin, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		g := base
@@ -726,20 +1007,14 @@ func (m Model) openGraph() (tea.Model, tea.Cmd) {
 			return graphReadyMsg{graph: g, err: err}
 		}
 		return graphReadyMsg{graph: g}
-	}
+	})
 }
 
+// syncGraphViewport relayouts the graph (cheap: autog on a few dozen nodes)
+// and scrolls to keep the selected node on screen.
 func (m *Model) syncGraphViewport() {
-	content := renderGraph(m.graph, m.graphCursor, m.width, m.height)
-	m.vp.SetContent(content)
-	if len(m.graph.Nodes) == 0 {
-		return
-	}
-	rows := layoutRows(m.graph.Nodes)
-	if m.graphCursor >= 0 && m.graphCursor < len(rows) {
-		// Each row slot ≈ box height + gap (~6 lines).
-		m.vp.SetYOffset(max(0, rows[m.graphCursor].row*6-1))
-	}
+	m.gl = computeGraphLayout(m.graph)
+	m.followCursor()
 }
 
 // graphMoveParent: h/left — step toward the root.
@@ -799,8 +1074,31 @@ func graphMoveSibling(nodes []argo.GraphNode, cur int, delta int) int {
 	return sibs[pos]
 }
 
-func graphNodeSummary(n argo.GraphNode) string {
-	return fmt.Sprintf("Graph node:\n  %s\n  %s\n  health=%s sync=%s", n.Title, n.Subtitle, n.Health, n.Status)
+// nodeDescribe is the describe of one managed resource of an Application.
+func nodeDescribe(n argo.GraphNode, app argo.Resource) string {
+	line := func(k, v string) string {
+		if v == "" {
+			return ""
+		}
+		return fmt.Sprintf("%-14s%s\n", k+":", v)
+	}
+	gv := n.Version
+	if n.Group != "" {
+		gv = n.Group + "/" + n.Version
+	}
+	return line("Kind", n.Kind) + line("Name", n.Name) + line("Namespace", n.Namespace) +
+		line("APIVersion", gv) + line("Health", n.Health) + line("Sync", n.Status) +
+		line("Info", n.Meta) + line("Application", app.Namespace+"/"+app.Name) +
+		"\n" + "YAML:         y  (live manifest)\n"
+}
+
+// showDetail opens the describe view; it goes through syncYAMLViewport so keys
+// get the same coloring as YAML.
+func (m *Model) showDetail(title, text string) {
+	m.detailText, m.detailTitle, m.yamlX, m.textFilter = text, title, 0, ""
+	m.pushView(viewDetail)
+	m.syncYAMLViewport()
+	m.vp.GotoTop()
 }
 
 func runOp(fn func(context.Context) (string, error)) tea.Cmd {
@@ -817,12 +1115,12 @@ func (m Model) runConfirm() (tea.Model, tea.Cmd) {
 	m.mode = viewList
 	switch m.confirmAction {
 	case "delete":
-		return m, runOp(func(ctx context.Context) (string, error) {
+		return m, tea.Batch(m.startLoading("deleting "+r.Name), runOp(func(ctx context.Context) (string, error) {
 			if err := m.ops.Delete(ctx, r); err != nil {
 				return "", err
 			}
 			return fmt.Sprintf("deleted %s/%s", r.Kind, r.Name), nil
-		})
+		}))
 	default:
 		m.status = "unknown action"
 		m.statusErr = true
@@ -835,6 +1133,7 @@ func (m Model) executeCommand(cmd string) (tea.Model, tea.Cmd) {
 	if len(parts) == 0 {
 		return m, nil
 	}
+	m.statusErr = false // a new command starts clean; error branches set it again
 	switch strings.ToLower(parts[0]) {
 	case "q", "q!", "quit":
 		if m.cancel != nil {
@@ -939,23 +1238,19 @@ func (m Model) executeCommand(cmd string) (tea.Model, tea.Cmd) {
 		m.refreshList()
 		m.status = "sync filter: synced"
 		return m, nil
-	case "ctx", "context":
-		if m.session != nil && m.session.Type == config.ConnArgoCD {
-			m.status = fmt.Sprintf("connection=%s  %s  (restart argo9s to switch)", m.session.Name, m.session.Label)
-			return m, nil
-		}
-		if len(parts) < 2 {
-			names, current, err := kube.ContextNames()
-			if err != nil {
-				m.status = err.Error()
-				m.statusErr = true
-				return m, nil
-			}
-			m.status = fmt.Sprintf("current=%s available=%s", current, strings.Join(names, ", "))
-			return m, nil
-		}
-		m.status = "switch kube context: argo9s --context <name>  |  switch Argo: argo9s --connection <name>"
-		m.statusErr = true
+	case "ctx", "context", "contexts":
+		m.drill = nil
+		m.filterKind = argo.KindContext
+		m.cursor = 0
+		m.refreshList()
+		m.status = "contexts: enter to switch connection"
+		return m, nil
+	case "cluster", "clusters", "cl":
+		m.drill = nil
+		m.filterKind = argo.KindCluster
+		m.cursor = 0
+		m.refreshList()
+		m.status = "clusters: enter to list their apps"
 		return m, nil
 	case "app", "apps", "application", "applications":
 		m.filterKind = argo.KindApplication
@@ -1015,13 +1310,212 @@ func (m *Model) current() (argo.Resource, bool) {
 	return m.resources[m.cursor], true
 }
 
+// belongsTo reports whether app r is a child of the drilled appset / project / cluster.
+func belongsTo(r, parent argo.Resource) bool {
+	if r.Kind != argo.KindApplication {
+		return false
+	}
+	switch parent.Kind {
+	case argo.KindApplicationSet:
+		return r.Owner == parent.Name
+	case argo.KindAppProject:
+		return r.Project == parent.Name
+	case argo.KindCluster:
+		return r.Cluster == parent.Name
+	}
+	return false
+}
+
+// clusterRows aggregates Applications per destination cluster.
+func clusterRows(apps []argo.Resource) []argo.Resource {
+	byName := map[string]*argo.Resource{}
+	var order []string
+	for _, a := range apps {
+		c := orDash(a.Cluster)
+		row, ok := byName[c]
+		if !ok {
+			row = &argo.Resource{Kind: argo.KindCluster, Name: c, Namespace: "-", Project: "-", Sync: "Synced", Health: "Healthy", Owner: "-"}
+			byName[c] = row
+			order = append(order, c)
+		}
+		if strings.EqualFold(strings.ReplaceAll(a.Sync, " ", ""), "outofsync") {
+			row.Sync = "OutOfSync"
+		}
+		switch strings.ToLower(a.Health) {
+		case "degraded", "missing":
+			row.Health = "Degraded"
+		case "progressing":
+			if row.Health == "Healthy" {
+				row.Health = "Progressing"
+			}
+		}
+	}
+	out := make([]argo.Resource, 0, len(order))
+	for _, c := range order {
+		row := *byName[c]
+		out = append(out, row)
+	}
+	return out
+}
+
+// contextRows lists configured connections (k9s :ctx).
+func (m Model) contextRows() []argo.Resource {
+	current := ""
+	if m.session != nil {
+		current = m.session.Name
+	}
+	conns := m.cfg.Connections
+	if m.session != nil && !slices.ContainsFunc(conns, func(c config.Connection) bool { return c.Name == current }) {
+		// --server / --demo sessions aren't in the config file but are still "where you are"
+		conns = append([]config.Connection{m.session.Conn}, conns...)
+		conns[0].Name = current
+	}
+	out := make([]argo.Resource, 0, len(conns))
+	for _, c := range conns {
+		target := c.Server
+		if c.Type == config.ConnKubernetes {
+			target = orDash(c.Context)
+		}
+		state := "-"
+		if c.Name == current {
+			state = "active"
+		}
+		out = append(out, argo.Resource{Kind: argo.KindContext, Name: c.Name, Namespace: "-", Project: c.Type, Sync: state, Health: "-", Cluster: target, Owner: "-", Revision: "-"})
+	}
+	return out
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// drillInto lists the Applications that belong to r.
+func (m *Model) drillInto(r argo.Resource) {
+	m.drillPrevKind, m.drillPrevCursor = m.filterKind, m.cursor
+	m.drill = &r
+	m.filterKind = argo.KindApplication
+	m.cursor = 0
+	m.refreshList()
+	m.status, m.statusErr = fmt.Sprintf("%d apps in %s %s", len(m.resources), r.Kind.Short(), r.Name), false
+}
+
+func (m *Model) drillBack() {
+	m.filterKind, m.cursor = m.drillPrevKind, m.drillPrevCursor
+	m.drill = nil
+	m.refreshList()
+	m.status, m.statusErr = "", false
+}
+
+// describeText adds the child Applications for appsets / projects / clusters.
+func (m Model) describeText(r argo.Resource) string {
+	text := argo.Describe(r)
+	if r.Kind == argo.KindContext {
+		return text + fmt.Sprintf("Type:         %s\nTarget:       %s\nActive:       %v\n", r.Project, r.Cluster, r.Sync == "active")
+	}
+	var kids []argo.Resource
+	for _, a := range m.store.List(argo.KindApplication, m.namespace, m.allNS) {
+		if belongsTo(a, r) {
+			kids = append(kids, a)
+		}
+	}
+	if r.Kind == argo.KindApplication || (len(kids) == 0 && r.Kind != argo.KindApplicationSet) {
+		return text
+	}
+	sort.Slice(kids, func(i, j int) bool { return kids[i].Name < kids[j].Name })
+	text += fmt.Sprintf("\nApplications (%d):\n", len(kids))
+	for _, a := range kids {
+		text += fmt.Sprintf("  • %-40s %-10s %-11s %s\n", a.Name, a.Sync, a.Health, orDash(a.Cluster))
+	}
+	return text
+}
+
+// capsLockSuspect: terminals can't report Caps Lock, so an uppercase letter
+// that is bound nowhere (J, K, D, Y, …) is the tell. Bound ones keep working.
+func capsLockSuspect(key string) bool {
+	return len(key) == 1 && key[0] >= 'A' && key[0] <= 'Z' && !strings.Contains(boundUpperKeys, key)
+}
+
+// boundUpperKeys: Q quit, R sync, F hard refresh, G bottom, N/A/T/S sort.
+const boundUpperKeys = "QRFGNATS"
+
+// filterMatcher follows k9s "/" semantics: case-insensitive regex, plain
+// substring if the regex is invalid, leading "!" inverts. nil = no filter.
+func filterMatcher(f string) func(string) bool {
+	inverse := strings.HasPrefix(f, "!")
+	f = strings.TrimPrefix(f, "!")
+	if f == "" {
+		return nil
+	}
+	match := func(s string) bool { return strings.Contains(strings.ToLower(s), strings.ToLower(f)) }
+	if re, err := regexp.Compile("(?i)" + f); err == nil {
+		match = re.MatchString
+	}
+	return func(s string) bool { return match(s) != inverse }
+}
+
+func filterLines(lines []string, f string) []string {
+	match := filterMatcher(f)
+	if match == nil {
+		return lines
+	}
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if match(l) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// setFilter routes "/" input to the list or to the open text view.
+func (m *Model) setFilter(v string) {
+	switch m.mode {
+	case viewLogs:
+		m.textFilter = v
+		m.syncLogViewport()
+	case viewYAML, viewDetail:
+		m.textFilter = v
+		m.syncYAMLViewport()
+		m.vp.GotoTop()
+	case viewGraph:
+		m.graphQuery = v
+		if ms := graphMatches(m.graph, m.gl, v); len(ms) > 0 {
+			m.graphCursor = ms[0]
+			m.followCursor()
+		}
+	default:
+		m.filter = v
+		m.refreshList()
+	}
+}
+
 func (m *Model) refreshList() {
 	// Argo API lists apps across namespaces; never filter to local kube ns.
 	if m.session != nil && m.session.Type == config.ConnArgoCD {
 		m.allNS = true
 		m.namespace = "all"
 	}
-	items := m.store.List(m.filterKind, m.namespace, m.allNS)
+	var items []argo.Resource
+	switch m.filterKind {
+	case argo.KindCluster:
+		items = clusterRows(m.store.List(argo.KindApplication, m.namespace, m.allNS))
+	case argo.KindContext:
+		items = m.contextRows()
+	default:
+		items = m.store.List(m.filterKind, m.namespace, m.allNS)
+	}
+	if m.drill != nil {
+		filtered := items[:0:0]
+		for _, r := range items {
+			if belongsTo(r, *m.drill) {
+				filtered = append(filtered, r)
+			}
+		}
+		items = filtered
+	}
 	if m.projectFilter != "" {
 		pf := strings.ToLower(m.projectFilter)
 		filtered := make([]argo.Resource, 0, len(items))
@@ -1051,12 +1545,11 @@ func (m *Model) refreshList() {
 		}
 		items = filtered
 	}
-	if m.filter != "" {
-		f := strings.ToLower(m.filter)
+	if match := filterMatcher(m.filter); match != nil {
 		filtered := make([]argo.Resource, 0, len(items))
 		for _, r := range items {
-			hay := strings.ToLower(r.Name + " " + r.Namespace + " " + string(r.Kind) + " " + r.Project + " " + r.Sync + " " + r.Health + " " + r.Message + " " + r.ConditionSummary())
-			if strings.Contains(hay, f) {
+			hay := r.Name + " " + r.Namespace + " " + string(r.Kind) + " " + r.Project + " " + r.Sync + " " + r.Health + " " + r.Message + " " + r.ConditionSummary()
+			if match(hay) {
 				filtered = append(filtered, r)
 			}
 		}
@@ -1095,105 +1588,219 @@ func (m Model) View() string {
 	if m.quitting {
 		return ""
 	}
+	if m.mode == viewGraph {
+		return m.renderGraphScreen()
+	}
 
 	header := m.renderHeader()
 	footer := m.renderFooter()
-	var body string
+	var prompt string
+	switch {
+	case m.filtering:
+		prompt = promptBox("/"+m.filterIn.View(), lipgloss.Color("114"), m.width)
+	case m.commanding:
+		prompt = promptBox(m.cmdIn.View(), lipgloss.Color("51"), m.width)
+	}
+	innerH := m.innerHeight()
+	frameH := innerH + 2
+	m.vp.Height = innerH
 
+	var title, body string
 	switch m.mode {
-	case viewHelp, viewDetail, viewYAML, viewGraph, viewLogs:
-		if m.mode == viewGraph {
-			body = m.vp.View()
-		} else if m.mode == viewLogs {
-			title := lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("Logs %s/%s", m.logNS, m.logPod))
-			body = title + "\n" + m.vp.View()
-		} else {
-			title := map[viewMode]string{
-				viewHelp:   "Help",
-				viewDetail: fmt.Sprintf("Describe %s/%s", m.selected.Kind, m.selected.Name),
-				viewYAML:   fmt.Sprintf("YAML %s/%s", m.selected.Kind, m.selected.Name),
-			}[m.mode]
-			body = lipgloss.NewStyle().Bold(true).Render(title) + "\n" + m.vp.View()
+	case viewContainers:
+		pod := ""
+		if m.graphCursor >= 0 && m.graphCursor < len(m.graph.Nodes) {
+			pod = m.graph.Nodes[m.graphCursor].Name
 		}
+		title, body = titleOf("containers", pod, len(m.containers), ""), m.renderContainers()
+	case viewTree:
+		title, body = titleOf("resources", m.selected.Namespace+"/"+m.selected.Name, len(treeRows(m.graph.Nodes, m.expanded)), ""), m.renderTree(innerH-1)
+	case viewGraph:
+		title, body = titleOf("graph", m.selected.Namespace+"/"+m.selected.Name, len(m.graph.Nodes), ""), m.vp.View()
+	case viewLogs:
+		what := m.logNS + "/" + m.logPod
+		if m.podContainer != "" {
+			what += ":" + m.podContainer
+		}
+		title, body = titleOf("logs", what, -1, m.textFilter), m.vp.View()
+	case viewYAML:
+		what := string(m.selected.Kind) + "/" + m.selected.Name
+		if m.detailTitle != "" {
+			what = m.detailTitle
+		}
+		title, body = titleOf("yaml", what, -1, m.textFilter), m.vp.View()
+	case viewDetail:
+		what := string(m.selected.Kind) + "/" + m.selected.Name
+		if m.detailTitle != "" {
+			what = m.detailTitle
+		}
+		title, body = titleOf("describe", what, -1, m.textFilter), m.vp.View()
+	case viewHelp:
+		title, body = titleOf("help", "", -1, ""), m.vp.View()
 	case viewConfirm:
-		body = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true).Render(
+		title = titleOf("confirm", "", -1, "")
+		body = "\n  " + lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true).Render(
 			fmt.Sprintf("Delete %s/%s/%s? [y/n]", m.confirmTarget.Kind, m.confirmTarget.Namespace, m.confirmTarget.Name),
 		)
 	default:
-		body = m.renderTable()
+		ns := m.namespace
+		if m.allNS {
+			ns = "all"
+		}
+		kind := "all"
+		if m.filterKind != argo.KindAll {
+			kind = m.filterKind.Plural()
+		}
+		scope := ns
+		if m.drill != nil {
+			scope = m.drill.Kind.Short() + ":" + m.drill.Name
+		}
+		if m.filterKind == argo.KindContext {
+			scope = ""
+		}
+		title = titleOf(kind, scope, len(m.resources), m.filter)
+		inner := m
+		inner.width = max(20, m.width-2)
+		body = inner.renderTable(innerH - 1) // -1 for the column header row
 	}
 
-	parts := []string{header, body}
-	if m.filtering {
-		parts = append(parts, "/"+m.filterIn.View())
+	parts := []string{header}
+	if prompt != "" {
+		parts = append(parts, prompt)
 	}
-	if m.commanding {
-		parts = append(parts, m.cmdIn.View())
-	}
-	parts = append(parts, footer)
+	parts = append(parts, frame(title, body, m.width, frameH), footer)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
+// innerHeight is the row count inside the body frame: the frame fills whatever the
+// header, prompt and footer (2 lines) leave, so the footer stays pinned to the bottom.
+func (m Model) innerHeight() int {
+	used := lipgloss.Height(m.renderHeader()) + 2 + 2 // footer + frame borders
+	if m.filtering || m.commanding {
+		used += 3
+	}
+	return max(3, m.height-used)
+}
+
+// k9s default skin colors (256-color approximations).
+var (
+	colOrange  = lipgloss.Color("214")
+	colBlue    = lipgloss.Color("33")
+	colAqua    = lipgloss.Color("51")
+	colFuchsia = lipgloss.Color("201")
+
+	labelStyle   = lipgloss.NewStyle().Foreground(colOrange).Bold(true)
+	valueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
+	keyStyle     = lipgloss.NewStyle().Foreground(colBlue).Bold(true)
+	keyDescStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+)
+
+// titleOf builds a k9s table title: " kind(scope)[count] </filter> ".
+func titleOf(kind, scope string, count int, filter string) string {
+	s := lipgloss.NewStyle().Foreground(colAqua).Bold(true).Render(kind)
+	if scope != "" {
+		s += lipgloss.NewStyle().Foreground(colAqua).Render("(") + lipgloss.NewStyle().Foreground(colFuchsia).Bold(true).Render(scope) + lipgloss.NewStyle().Foreground(colAqua).Render(")")
+	}
+	if count >= 0 {
+		s += valueStyle.Render(fmt.Sprintf("[%d]", count))
+	}
+	if filter != "" {
+		s += " " + lipgloss.NewStyle().Foreground(colAqua).Render("</") + lipgloss.NewStyle().Foreground(colFuchsia).Render(filter) + lipgloss.NewStyle().Foreground(colAqua).Render(">")
+	}
+	return " " + s + " "
+}
+
+// frame draws a single-line box with a centered title in the top border, like k9s.
+func frame(title, body string, width, height int) string {
+	if width <= 0 {
+		width = 80
+	}
+	innerW, innerH := max(1, width-2), max(1, height-2)
+	bc := lipgloss.NewStyle().Foreground(colBlue)
+	tw := lipgloss.Width(title)
+	if tw > innerW {
+		title, tw = "", 0
+	}
+	left := (innerW - tw) / 2
+	lines := []string{bc.Render("┌"+strings.Repeat("─", left)) + title + bc.Render(strings.Repeat("─", innerW-tw-left)+"┐")}
+	bodyLines := strings.Split(body, "\n")
+	clip := lipgloss.NewStyle().MaxWidth(innerW)
+	for i := 0; i < innerH; i++ {
+		l := ""
+		if i < len(bodyLines) {
+			l = clip.Render(bodyLines[i])
+		}
+		lines = append(lines, bc.Render("│")+l+strings.Repeat(" ", max(0, innerW-lipgloss.Width(l)))+bc.Render("│"))
+	}
+	lines = append(lines, bc.Render("└"+strings.Repeat("─", innerW)+"┘"))
+	return strings.Join(lines, "\n")
+}
+
+func promptBox(content string, color lipgloss.Color, width int) string {
+	if width <= 0 {
+		width = 80
+	}
+	return lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(color).Width(max(1, width-2)).Render(content)
+}
+
 func (m Model) renderHeader() string {
-	ro := "RW"
-	roStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
+	ro, roColor := "RW", lipgloss.Color("114")
 	if m.ops.ReadOnly() {
-		ro = "READONLY"
-		roStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+		ro, roColor = "RO", colOrange
 	}
 	ns := m.namespace
 	if m.allNS {
 		ns = "all"
 	}
-
-	counts := m.countByKind()
 	connType := "kubernetes"
 	if m.session != nil {
 		connType = m.session.Type
 	}
-	leftLines := []string{
-		fmt.Sprintf("Connection: %s (%s)", m.context, connType),
-		fmt.Sprintf("Namespace: %s   %s", ns, roStyle.Render(ro)),
-		fmt.Sprintf("View: %s", m.filterKind.Short()),
+	counts := m.countByKind()
+	kv := func(label, value string) string {
+		return labelStyle.Render(fmt.Sprintf("%-12s", label+":")) + value
 	}
+	info := []string{
+		kv("Context", valueStyle.Render(m.context)+" "+lipgloss.NewStyle().Foreground(roColor).Bold(true).Render("["+ro+"]")),
+		kv("Type", valueStyle.Render(connType)),
+		kv("Namespace", valueStyle.Render(ns)),
+		kv("Argo CD", valueStyle.Render(orDash(m.argoVersion))),
+	}
+	if m.k8sVersion != "" {
+		info = append(info, kv("K8s", valueStyle.Render(m.k8sVersion)))
+	}
+	info = append(info,
+		kv("argo9s", valueStyle.Render(appVersion)),
+		kv("Apps", valueStyle.Render(fmt.Sprint(counts[argo.KindApplication]))+
+			labelStyle.Render("  AppSets ")+valueStyle.Render(fmt.Sprint(counts[argo.KindApplicationSet]))+
+			labelStyle.Render("  Projects ")+valueStyle.Render(fmt.Sprint(counts[argo.KindAppProject]))),
+	)
 	if m.projectFilter != "" {
-		leftLines = append(leftLines, lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render("Project: "+m.projectFilter))
+		info = append(info, kv("Project", valueStyle.Render(m.projectFilter)))
 	}
 	if m.nameFilter != "" {
-		leftLines = append(leftLines, lipgloss.NewStyle().Foreground(lipgloss.Color("117")).Render("Name: "+m.nameFilter))
+		info = append(info, kv("Name", valueStyle.Render(m.nameFilter)))
 	}
 	if m.syncFilter != "" {
-		syncColor := lipgloss.Color("114")
-		if m.syncFilter == "outofsync" {
-			syncColor = lipgloss.Color("214")
-		}
-		leftLines = append(leftLines, lipgloss.NewStyle().Foreground(syncColor).Render("Sync: "+m.syncFilter))
+		info = append(info, kv("Sync", valueStyle.Render(m.syncFilter)))
 	}
-	leftLines = append(leftLines,
-		"",
-		fmt.Sprintf("Applications     %d", counts[argo.KindApplication]),
-		fmt.Sprintf("ApplicationSets  %d", counts[argo.KindApplicationSet]),
-		fmt.Sprintf("AppProjects      %d", counts[argo.KindAppProject]),
-		fmt.Sprintf("Listed           %d", len(m.resources)),
-	)
-	left := strings.Join(leftLines, "\n")
+	left := strings.Join(info, "\n")
 
-	subtitle := logoSubtitle(appVersion, "Argo CD")
-	var right string
+	subtitle := "" // versions live in the info block (argo9s / Argo CD / K8s), like k9s
+	logo := renderLogoCompact(subtitle)
 	if m.width >= 100 {
-		right = renderLogo(subtitle)
-	} else {
-		right = renderLogoCompact(subtitle)
+		logo = renderLogo(subtitle)
 	}
-
-	gap := 4
-	leftW := lipgloss.Width(left)
-	rightW := lipgloss.Width(right)
-	spacer := max(2, m.width-leftW-rightW-gap)
-	if m.width > 0 && leftW+rightW+gap > m.width {
-		return lipgloss.JoinVertical(lipgloss.Left, left, right)
+	if m.width <= 0 {
+		return lipgloss.JoinHorizontal(lipgloss.Top, left, "    ", logo)
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", spacer), right)
+	if lipgloss.Width(left)+lipgloss.Width(logo)+4 > m.width {
+		return lipgloss.JoinVertical(lipgloss.Left, left, logo)
+	}
+	mid := m.width - lipgloss.Width(left) - lipgloss.Width(logo) - 4
+	menu := renderMenu(m.keyHints(), mid, 6)
+	gap := strings.Repeat(" ", max(2, mid-lipgloss.Width(menu)+2))
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", menu, gap, logo)
 }
 
 func (m Model) countByKind() map[argo.Kind]int {
@@ -1204,139 +1811,100 @@ func (m Model) countByKind() map[argo.Kind]int {
 	return out
 }
 
+func (m Model) keyHints() [][2]string {
+	switch m.mode {
+	case viewLogs:
+		return [][2]string{{"/", "Filter"}, {"h/l", "Scroll"}, {"p", "Previous"}, {"esc", "Stop"}}
+	case viewYAML:
+		return [][2]string{{"/", "Filter"}, {"h/l", "Scroll"}, {"e", "Edit"}, {"esc", "Back"}}
+	case viewDetail:
+		return [][2]string{{"/", "Filter"}, {"esc", "Back"}}
+	case viewTree:
+		return [][2]string{{"enter", "Expand/Collapse"}, {"←/→", "Collapse/Expand"}, {"d", "Describe"}, {"y", "YAML"}, {"e", "Edit"}, {"l", "Logs (pod)"}, {"s", "Shell (pod)"}, {"o", "Old RS"}, {"esc", "Back"}}
+	case viewContainers:
+		return [][2]string{{"enter", "Open"}, {"l", "Logs"}, {"s", "Shell"}, {"j/k", "Move"}, {"esc", "Back"}}
+	case viewGraph:
+		return [][2]string{{"/", "Search"}, {"n/N", "Next match"}, {"h/l", "Parent/Child"}, {"j/k", "Siblings"}, {"pgup/pgdn", "Page"}, {"tab", "Next issue"}, {"o", "Old RS"}, {"d", "Describe"}, {"y", "YAML"}, {"e", "Edit"}, {"l", "Logs (pod)"}, {"s", "Shell (pod)"}, {"esc", "Back"}}
+	case viewHelp, viewConfirm:
+		return [][2]string{{"esc", "Back"}}
+	}
+	return [][2]string{
+		{"enter", "View"}, {"d", "Describe"}, {"y", "YAML"}, {"g", "Graph"}, {"/", "Filter"}, {":", "Command"},
+		{"R", "Sync"}, {"f", "Refresh"}, {"F", "Hard Refresh"}, {"s", "Suspend"}, {"r", "Resume"}, {"ctrl-d", "Delete"},
+		{"shift-n", "Sort Name"}, {"shift-a", "Sort Age"}, {"shift-s", "Sort Status"}, {"shift-t", "Sort Type"}, {"?", "Help"},
+		{":ctx", "Contexts"}, {":clusters", "Clusters"}, {":appsets", "AppSets"}, {":projects", "Projects"},
+	}
+}
+
+// renderMenu lays "<key> Desc" hints out in columns of `rows`, k9s-style,
+// dropping whole columns that don't fit in width.
+func renderMenu(keys [][2]string, width, rows int) string {
+	var cols []string
+	used := 0
+	for i := 0; i < len(keys); i += rows {
+		chunk := keys[i:min(i+rows, len(keys))]
+		kw, dw := 0, 0
+		for _, k := range chunk {
+			kw, dw = max(kw, lipgloss.Width(k[0])+2), max(dw, lipgloss.Width(k[1]))
+		}
+		colW := kw + 1 + dw
+		if used+colW+3 > width {
+			break
+		}
+		used += colW + 3
+		lines := make([]string, len(chunk))
+		for j, k := range chunk {
+			key := "<" + k[0] + ">"
+			lines[j] = keyStyle.Render(key) + strings.Repeat(" ", kw-lipgloss.Width(key)+1) + keyDescStyle.Render(fmt.Sprintf("%-*s", dw, k[1]))
+		}
+		cols = append(cols, strings.Join(lines, "\n"), "   ")
+	}
+	if len(cols) == 0 {
+		return ""
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, cols[:len(cols)-1]...)
+}
+
+// renderFooter: k9s crumbs (view stack) + flash/status line.
 func (m Model) renderFooter() string {
-	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
+	names := map[viewMode]string{viewList: "apps", viewDetail: "describe", viewYAML: "yaml", viewGraph: "graph", viewHelp: "help", viewConfirm: "confirm", viewLogs: "logs", viewTree: "resources", viewContainers: "containers"}
+	crumb := lipgloss.NewStyle().Background(lipgloss.Color("33")).Foreground(lipgloss.Color("16")).Padding(0, 1)
+	listName := "all"
+	if m.filterKind != argo.KindAll {
+		listName = m.filterKind.Plural()
+	}
+	names[viewList] = listName
+	var crumbs []string
+	if m.drill != nil {
+		crumbs = append(crumbs, crumb.Render("<"+m.drill.Kind.Plural()+">"))
+	}
+	for _, v := range m.viewStack {
+		crumbs = append(crumbs, crumb.Render("<"+names[v]+">"))
+	}
+	crumbs = append(crumbs, crumb.Background(colOrange).Bold(true).Render("<"+names[m.mode]+">"))
+
+	statusStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
 	if m.statusErr {
 		statusStyle = statusStyle.Foreground(lipgloss.Color("196"))
 	}
-	keys := "?:help  /:filter  :name  :sync outofsync  :project  g:graph  R:sync  s:suspend  r:resume"
-	switch {
-	case m.mode == viewLogs:
-		keys = "h/l scroll  p:previous  j/k  esc:stop"
-	case m.mode == viewYAML:
-		keys = "h/l scroll  e:edit  j/k  esc:back"
-	case m.mode == viewGraph:
-		keys = "y:yaml e:edit  l on pod:logs  → child  esc:back"
-	case m.width > 0 && m.width < 100:
-		keys = "?:help :name :sync oos g:graph s/r R:sync q:back"
+	status := statusStyle.Render(truncate(m.status, max(10, m.width)))
+	if m.loading != "" {
+		elapsed := time.Since(m.loadStart).Truncate(time.Second)
+		status = progressBar(m.spin, 24) + " " + lipgloss.NewStyle().Foreground(colAqua).Render(fmt.Sprintf("%s… %s", m.loading, elapsed))
 	}
-	if m.width > 0 {
-		keys = truncate(keys, m.width)
-	}
-	status := m.status
-	if m.width > 0 {
-		status = truncate(status, m.width)
-	}
-	return statusStyle.Render(status) + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(keys)
+	return strings.Join(crumbs, " ") + "\n" + lipgloss.PlaceHorizontal(max(1, m.width), lipgloss.Center, status)
 }
 
-// tableCols sizes list columns to the terminal width. Narrow terminals drop
-// NAMESPACE / PROJECT / REV; leftover width goes to NAME.
-type tableCols struct {
-	kind, ns, name, project, sync, health, rev, age int
-	showNS, showProject, showRev                    bool
-}
-
-func computeTableCols(termW int) tableCols {
-	if termW <= 0 {
-		termW = 100
-	}
-	const indent = 2
-	const markers = 6 // room for " ⏸ !" (emoji can be 2 cells)
-	avail := termW - indent - markers
-
-	c := tableCols{
-		kind: 6, ns: 12, project: 12, sync: 10, health: 10, rev: 8, age: 5,
-		showNS: true, showProject: true, showRev: true,
-	}
-
-	fixed := func() int {
-		n, gaps := c.kind+c.sync+c.health+c.age, 3
-		if c.showNS {
-			n += c.ns
-			gaps++
-		}
-		if c.showProject {
-			n += c.project
-			gaps++
-		}
-		if c.showRev {
-			n += c.rev
-			gaps++
-		}
-		return n + gaps // single spaces between columns
-	}
-
-	for fixed()+12 > avail { // need at least ~12 for NAME
-		switch {
-		case c.showRev:
-			c.showRev, c.rev = false, 0
-		case c.showProject && c.project > 8:
-			c.project = 8
-		case c.showNS && c.ns > 8:
-			c.ns = 8
-		case c.showProject:
-			c.showProject, c.project = false, 0
-		case c.showNS:
-			c.showNS, c.ns = false, 0
-		case c.sync > 8:
-			c.sync = 8
-		case c.health > 8:
-			c.health = 8
-		default:
-			c.name = max(8, avail-fixed())
-			return c
-		}
-	}
-
-	c.name = max(12, avail-fixed())
-	// Keep NAME compact so SYNC/HEALTH stay near the name, not far right.
-	const nameCap = 32
-	if c.name > nameCap {
-		extra := c.name - nameCap
-		c.name = nameCap
-		if c.showProject {
-			c.project += extra / 2
-			extra -= extra / 2
-		}
-		if c.showNS {
-			c.ns += extra
-		}
-	}
-	return c
-}
-
-func (c tableCols) formatRow(kind, ns, name, project, sync, health, rev, age string) string {
-	parts := []string{padTruncate(kind, c.kind)}
-	if c.showNS {
-		parts = append(parts, padTruncate(ns, c.ns))
-	}
-	// NAME then SYNC/HEALTH — statuses sit next to the app name.
-	parts = append(parts, padTruncate(name, c.name), padTruncate(sync, c.sync), padTruncate(health, c.health))
-	if c.showProject {
-		parts = append(parts, padTruncate(project, c.project))
-	}
-	if c.showRev {
-		parts = append(parts, padTruncate(rev, c.rev))
-	}
-	parts = append(parts, padTruncate(age, c.age))
-	return "  " + strings.Join(parts, " ")
-}
-
-func (m Model) renderTable() string {
+func (m Model) renderTable(maxRows int) string {
 	if len(m.resources) == 0 {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render("  no resources (is Argo CD installed? try :ns all)")
 	}
 
-	cols := computeTableCols(m.width)
-	header := cols.formatRow("KIND", "NAMESPACE", "NAME", "PROJECT", "SYNC", "HEALTH", "REV", "AGE")
-	lines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Bold(true).Render(header)}
+	cols := layoutColumns(m.columnsFor(), m.width)
+	header := formatRow(cols, nil)
+	lines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true).Render(header)}
 
-	headerLines := 10
-	if m.width > 0 && m.width < 100 {
-		headerLines = 8
-	}
-	maxRows := max(3, m.height-headerLines)
+	maxRows = max(1, maxRows)
 	start := 0
 	if m.cursor >= maxRows {
 		start = m.cursor - maxRows + 1
@@ -1345,32 +1913,25 @@ func (m Model) renderTable() string {
 
 	for i := start; i < end; i++ {
 		r := m.resources[i]
-		line := cols.formatRow(
-			r.Kind.Short(),
-			r.Namespace,
-			r.Name,
-			r.Project,
-			r.Sync,
-			r.Health,
-			r.Revision,
-			r.AgeString(),
-		)
+		line := formatRow(cols, &r)
 		if r.Suspended {
-			line += " ⏸"
+			line += " ‖" // not ⏸: emoji width varies between terminals and shifts the frame
 		}
-		if r.HasConditions() {
-			line += " !"
-		}
-		style := lipgloss.NewStyle()
 		if i == m.cursor {
-			style = style.Background(lipgloss.Color("238")).Foreground(lipgloss.Color("255"))
+			if r.HasConditions() {
+				line += " !"
+			}
 			if m.width > 0 {
 				line = padTruncate(line, m.width)
 			}
-		} else {
-			style = style.Foreground(rowColor(r))
+			lines = append(lines, lipgloss.NewStyle().Background(lipgloss.Color("117")).Foreground(lipgloss.Color("16")).Bold(true).Render(line))
+			continue
 		}
-		lines = append(lines, style.Render(line))
+		line = lipgloss.NewStyle().Foreground(rowColor(r)).Render(line)
+		if r.HasConditions() {
+			line += lipgloss.NewStyle().Foreground(conditionColor(r)).Bold(true).Render(" !")
+		}
+		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1382,16 +1943,18 @@ func rowColor(r argo.Resource) lipgloss.Color {
 	if sync == "unknown" || health == "unknown" {
 		return lipgloss.Color("245")
 	}
+	// Like the Argo CD UI: the row follows sync/health; conditions only color the "!" marker.
+	return healthColor(r.Health, r.Sync)
+}
+
+// conditionColor: red when any condition is an error, orange for warnings.
+func conditionColor(r argo.Resource) lipgloss.Color {
 	for _, c := range r.Conditions {
-		t := strings.ToLower(c.Type)
-		if strings.Contains(t, "error") {
-			return lipgloss.Color("196") // red — ComparisonError / InvalidSpecError
-		}
-		if strings.Contains(t, "warning") {
-			return lipgloss.Color("214")
+		if strings.Contains(strings.ToLower(c.Type), "error") {
+			return lipgloss.Color("196")
 		}
 	}
-	return healthColor(r.Health, r.Sync)
+	return lipgloss.Color("214")
 }
 
 func healthColor(health, sync string) lipgloss.Color {
@@ -1472,118 +2035,65 @@ func padTruncate(s string, n int) string {
 
 func helpText() string {
 	return strings.TrimSpace(`
-argo9s — K9s-inspired TUI for Argo CD
+argo9s — a K9s-style terminal UI for Argo CD
 
-NAVIGATION
-  j/k, ↑/↓     move
-  home / G     top / bottom of list
-  g            resource graph (Application)
-  enter / d    describe (includes Application conditions)
-  /text        filter (also matches condition type/message)
-  y            YAML
-  /            name filter
-  :            command
-  ?            help
-  esc / q      back
-  Q            quit
+LISTS (apps, appsets, projects, clusters, contexts)
+  j/k ↑/↓          move            pgup/pgdn ctrl-f/b   page
+  home / end       first / last    esc                  clear filter, then go back
+  enter            app → managed resources tree
+                   appset / project / cluster → its applications
+                   context → switch connection
+  d                describe        y                    YAML
+  g                app → fullscreen resource graph
+  /text            filter (regex, case-insensitive; !text inverts)
+  N A T S          sort by name / age / type / status
 
-PROJECT FILTER
-  :project <name>     show Applications in that Argo CD project
-  :project clear      clear project filter
-  :p <name>           short form
+RESOURCE TREE (enter on an app)
+  enter/space      expand / collapse    →/l   expand    ←/h  collapse / parent
+  d y e            describe / YAML / edit the object
+  l s              pod logs / shell (asks for the container if several)
+  o                show / hide old ReplicaSets (0/0)
 
-NAME FILTER
-  :name <substr>      filter by application name
-  :n <substr>         short form
-  :name clear         clear
-  /text               live substring filter (name/ns/project/…)
+RESOURCE GRAPH (g on an app — fullscreen)
+  h/l              parent / child (follows the drawing)
+  j/k              up / down in the column   pgup/pgdn home/end  jump in column
+  /text  n/N       search objects, next / previous match
+  tab / shift-tab  next / previous unhealthy or out-of-sync object
+  d y e l s o      describe / YAML / edit / logs / shell / old ReplicaSets
 
-SYNC FILTER
-  :sync outofsync     only OutOfSync apps (yellow)
-  :sync synced        only Synced apps
-  :outofsync / :oos   shortcuts
-  :sync clear         clear sync filter
+LOGS · YAML · DESCRIBE
+  /text            keep matching lines only    esc  clear, then back
+  h/l ←/→  0       horizontal scroll / reset
+  p                logs: previous container (after a restart)
+  e                YAML: edit in $EDITOR and apply (read-write connections)
 
-COLORS
-  Healthy+Synced  green
-  OutOfSync       yellow
-  Progressing     blue
-  Degraded        red
-
-GRAPH VIEW (Argo CD UI style)
-  Select an Application, press g
-  Left→right: app → cm/svc/deploy → rs → pod
-  h/← parent    → child (also l on non-pod)
-  l on Pod      stream container logs (follow)
-  y             live YAML of selected node
-  e             edit YAML in $EDITOR (if not read-only)
-  j/↓ k/↑       siblings
-  enter describe, esc back
-
-LOGS
-  From graph: highlight a Pod, press l
-  h/l or ←/→    horizontal scroll (long lines)
-  0             reset horizontal offset
-  p             toggle previous container logs (restarts)
-  j/k scroll, esc stop / back
-
-YAML
-  y on graph node — view live manifest
-  e — edit via $EDITOR then apply (RW connections only)
-  h/l horizontal scroll
-
-ACTIONS (Applications; disabled in read-only)
-  R            sync
-  f / F        refresh / hard refresh
-  s / r        suspend (manual) / resume (auto-sync)
-  ctrl+d       delete (confirm)
+ACTIONS on applications (read-write connections only)
+  R                sync            f / F    refresh / hard refresh
+  s / r            suspend / resume auto-sync
+  ctrl+d           delete (asks to confirm)
 
 COMMANDS
-  :all / :app / :appset / :appproject
-  :ns <ns|all>
-  :project <name>
-  :graph
-  :readonly
-  :nocolor
-  :ctx
-  :q
+  :apps :appsets :projects :all      switch view
+  :clusters                          destination clusters
+  :ctx                               configured connections
+  :project <name> | clear            :p <name>
+  :name <text> | clear               :n <text>
+  :sync outofsync | synced | clear   :oos
+  :ns <namespace|all>
+  :graph   :readonly   :nocolor   :q
 
-SORT
-  N / A / T / S         name / age / type / status
-
-Default namespace: argocd. Read-only is ON by default.
+ctrl+c quits from anywhere. Keys are lowercase: a warning shows when Caps Lock seems on.
 `)
 }
 
-// Run starts the TUI for an opened session.
-func Run(sess *session.Session) error {
+// Run starts the TUI for an opened session. It returns the connection name picked
+// in :ctx ("" when the user just quit), so the caller can reopen and rerun.
+func Run(sess *session.Session) (string, error) {
 	cfg := sess.Cfg
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	ApplyColorMode(cfg.NoColor, sess.Type)
-
-	// Preload Argo API snapshot so the first frame isn't empty.
-	if sess.Type == config.ConnArgoCD && sess.Argo != nil {
-		warmCtx, warmCancel := context.WithTimeout(context.Background(), 60*time.Second)
-		apps, err := sess.Argo.ListApplications(warmCtx)
-		warmCancel()
-		if err != nil {
-			return fmt.Errorf("list applications: %w", err)
-		}
-		named := 0
-		for _, app := range apps {
-			r := argocd.ResourceFromAppMap(app)
-			if r.Name == "" {
-				continue
-			}
-			sess.Store.Upsert(r)
-			named++
-		}
-		if len(apps) > 0 && named == 0 {
-			return fmt.Errorf("parsed 0/%d application names (%s)", len(apps), argocd.SampleAppDiag(apps))
-		}
-	}
 
 	events := make(chan argo.Event, 256)
 	go func() {
@@ -1593,13 +2103,16 @@ func Run(sess *session.Session) error {
 
 	m := New(cfg, sess, events, cancel)
 	m.refreshList()
-	if n := len(m.resources); n > 0 {
+	if sess.Type == config.ConnArgoCD && sess.Argo != nil {
+		// Listed inside the TUI (Init) so the user sees progress instead of a frozen terminal.
+		m.loading, m.loadStart = "listing applications from Argo CD", time.Now()
+	} else if n := len(m.resources); n > 0 {
 		m.status = fmt.Sprintf("loaded %d resources (store=%d)", n, sess.Store.Len())
-	} else if sess.Type == config.ConnArgoCD {
-		m.status = fmt.Sprintf("no resources in view (store=%d) — try :ns all", sess.Store.Len())
-		m.statusErr = true
 	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
-	_, err := p.Run()
-	return err
+	final, err := p.Run()
+	if fm, ok := final.(Model); ok && err == nil {
+		return fm.switchTo, nil
+	}
+	return "", err
 }

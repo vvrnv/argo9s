@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	version   = "0.1.0"
+	version   = "0.2.0"
 	commit    = "none"
 	buildDate = "unknown"
 )
@@ -106,7 +106,8 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	ui.ApplyColorMode(cfg.NoColor, "")
 
 	if useDemo, _ := cmd.Flags().GetBool("demo"); useDemo {
-		return ui.Run(demo.Open(cfg))
+		_, err := ui.Run(demo.Open(cfg)) // single fake connection: nothing to switch to
+		return err
 	}
 
 	conn, err := resolveConnection(cmd, cfg)
@@ -120,21 +121,34 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	}
 
 	ctxName, _ := cmd.Flags().GetString("context")
-	timeout := time.Duration(cfg.ConnectTimeoutSeconds) * time.Second
-	if conn.Type == config.ConnArgoCD && timeout < 60*time.Second {
-		// Large Argo instances need more than the kube connect timeout.
-		timeout = 60 * time.Second
+	for {
+		timeout := time.Duration(cfg.ConnectTimeoutSeconds) * time.Second
+		if conn.Type == config.ConnArgoCD && timeout < 60*time.Second {
+			// Large Argo instances need more than the kube connect timeout.
+			timeout = 60 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		sess, err := session.Open(ctx, cfg, *conn, ctxName, timeout)
+		cancel()
+		if err != nil {
+			return err
+		}
+		next, err := ui.Run(sess)
+		if err != nil || next == "" {
+			return err
+		}
+		// :ctx picked another connection — reopen with it.
+		found := false
+		for i := range cfg.Connections {
+			if cfg.Connections[i].Name == next {
+				c := cfg.Connections[i]
+				conn, ctxName, found = &c, "", true
+			}
+		}
+		if !found {
+			return fmt.Errorf("connection %q not found", next)
+		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	sess, err := session.Open(ctx, cfg, *conn, ctxName, timeout)
-	if err != nil {
-		return err
-	}
-
-	return ui.Run(sess)
 }
 
 func resolveConnection(cmd *cobra.Command, cfg config.Config) (*config.Connection, error) {

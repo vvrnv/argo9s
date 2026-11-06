@@ -43,7 +43,7 @@ func (m *Model) stopLogs() {
 }
 
 func (m Model) openPodLogs() (tea.Model, tea.Cmd) {
-	return m.startPodLogs(false)
+	return m.podAction("logs") // picks the container first when the pod has several
 }
 
 func (m Model) startPodLogs(previous bool) (tea.Model, tea.Cmd) {
@@ -86,7 +86,7 @@ func (m Model) startPodLogs(previous bool) (tea.Model, tea.Cmd) {
 	follow := !previous
 
 	go func() {
-		err := sess.StreamPodLogs(ctx, app, podNS, podName, "", follow, previous, 200, func(line string) error {
+		err := sess.StreamPodLogs(ctx, app, podNS, podName, m.podContainer, follow, previous, 200, func(line string) error {
 			select {
 			case ch <- logOutMsg{line: line}:
 				return nil
@@ -136,7 +136,7 @@ func (m *Model) appendLogLine(line string) {
 }
 
 func (m *Model) syncLogViewport() {
-	m.vp.SetContent(shiftLines(m.logLines, m.logX))
+	m.vp.SetContent(shiftLines(filterLines(m.logLines, m.textFilter), m.logX))
 	if m.logFollow && !m.logPrevious {
 		m.vp.GotoBottom()
 	}
@@ -144,7 +144,11 @@ func (m *Model) syncLogViewport() {
 
 func (m *Model) syncYAMLViewport() {
 	lines := strings.Split(m.detailText, "\n")
-	m.vp.SetContent(shiftLines(lines, m.yamlX))
+	shown := strings.Split(shiftLines(filterLines(lines, m.textFilter), m.yamlX), "\n")
+	for i, l := range shown {
+		shown[i] = highlightYAML(l)
+	}
+	m.vp.SetContent(strings.Join(shown, "\n"))
 }
 
 func shiftLines(lines []string, xOff int) string {
@@ -218,7 +222,8 @@ func (m Model) openGraphNodeYAML(editAfter bool) (tea.Model, tea.Cmd) {
 	m.statusErr = false
 	app := m.selected
 	sess := m.session
-	return m, func() tea.Msg {
+	spin := m.startLoading(fmt.Sprintf("loading yaml %s/%s", n.Kind, n.Name))
+	return m, tea.Batch(spin, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		text, err := sess.GetResourceYAML(ctx, app, ref)
@@ -226,7 +231,7 @@ func (m Model) openGraphNodeYAML(editAfter bool) (tea.Model, tea.Cmd) {
 			return opDoneMsg{err: err}
 		}
 		return yamlLoadedMsg{text: text, ref: ref, edit: editAfter}
-	}
+	})
 }
 
 func (m Model) launchYAMLEditor(content string) tea.Cmd {

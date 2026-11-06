@@ -17,6 +17,9 @@ const (
 	KindApplicationSet Kind = "ApplicationSet"
 	KindAppProject     Kind = "AppProject"
 	KindAll            Kind = "All"
+	// Synthetic kinds: built in the UI, never watched.
+	KindCluster Kind = "Cluster" // an Application destination cluster
+	KindContext Kind = "Context" // a configured argo9s connection
 )
 
 var (
@@ -39,6 +42,10 @@ func (k Kind) Plural() string {
 		return "applicationsets"
 	case KindAppProject:
 		return "appprojects"
+	case KindCluster:
+		return "clusters"
+	case KindContext:
+		return "contexts"
 	default:
 		return strings.ToLower(string(k))
 	}
@@ -54,6 +61,10 @@ func (k Kind) Short() string {
 		return "project"
 	case KindAll:
 		return "all"
+	case KindCluster:
+		return "cluster"
+	case KindContext:
+		return "ctx"
 	default:
 		return strings.ToLower(string(k))
 	}
@@ -114,6 +125,8 @@ type Resource struct {
 	Suspended  bool
 	Message    string
 	Conditions []Condition
+	Owner      string // ApplicationSet that generated this Application, if any
+	Cluster    string // Application destination (name, or server host)
 	Raw        *unstructured.Unstructured
 }
 
@@ -189,6 +202,12 @@ func fromUnstructured(kind Kind, obj *unstructured.Unstructured, copyRaw bool) R
 			r.Revision, _, _ = unstructured.NestedString(obj.Object, "status", "operationState", "syncResult", "revision")
 		}
 		r.Repo = firstRepo(obj)
+		r.Cluster = clusterOf(obj)
+		for _, o := range obj.GetOwnerReferences() {
+			if o.Kind == "ApplicationSet" {
+				r.Owner = o.Name
+			}
+		}
 		r.Suspended = isAppSuspended(obj)
 		r.Conditions = parseConditions(obj)
 		r.Message, _, _ = unstructured.NestedString(obj.Object, "status", "health", "message")
@@ -202,7 +221,7 @@ func fromUnstructured(kind Kind, obj *unstructured.Unstructured, copyRaw bool) R
 	case KindApplicationSet:
 		r.Project = nestedTemplateProject(obj)
 		conds, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
-		r.Conditions = conditionsFromSlice(conds)
+		r.Conditions = appSetProblems(conds)
 		r.Sync, r.Health, r.Message = summarizeConditions(conds)
 		r.Repo = nestedTemplateRepo(obj)
 	case KindAppProject:
@@ -317,6 +336,27 @@ func parseConditions(obj *unstructured.Unstructured) []Condition {
 	return conditionsFromSlice(raw)
 }
 
+// appSetProblems keeps only ApplicationSet conditions that signal a problem.
+// Healthy appsets always carry informational ones (ErrorOccurred=False,
+// ResourcesUpToDate=True, …) which must not paint the row red or add "!".
+func appSetProblems(raw []any) []Condition {
+	var keep []any
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, _ := m["type"].(string)
+		status, _ := m["status"].(string)
+		isErr := strings.Contains(t, "Error") && status == "True"
+		notUpToDate := t == "ResourcesUpToDate" && status == "False"
+		if isErr || notUpToDate {
+			keep = append(keep, item)
+		}
+	}
+	return conditionsFromSlice(keep)
+}
+
 func conditionsFromSlice(raw []any) []Condition {
 	if len(raw) == 0 {
 		return nil
@@ -372,4 +412,21 @@ func primaryConditionMessage(conds []Condition) string {
 		}
 	}
 	return ""
+}
+
+// clusterOf returns a short destination label: destination.name, else the server
+// host ("in-cluster" for the local API server).
+func clusterOf(obj *unstructured.Unstructured) string {
+	if n, _, _ := unstructured.NestedString(obj.Object, "spec", "destination", "name"); n != "" {
+		return n
+	}
+	srv, _, _ := unstructured.NestedString(obj.Object, "spec", "destination", "server")
+	if srv == "https://kubernetes.default.svc" {
+		return "in-cluster"
+	}
+	srv = strings.TrimPrefix(strings.TrimPrefix(srv, "https://"), "http://")
+	if srv == "" {
+		return "-"
+	}
+	return srv
 }

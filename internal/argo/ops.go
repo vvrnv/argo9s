@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
 
@@ -157,37 +158,156 @@ func (o *Operator) YAML(r Resource) (string, error) {
 	return string(data), nil
 }
 
+// Describe renders a kubectl-describe-like summary, with sections per kind.
 func Describe(r Resource) string {
 	var b []byte
-	b = fmt.Appendf(b, "Kind:       %s\n", r.Kind)
-	b = fmt.Appendf(b, "Name:       %s\n", r.Name)
-	b = fmt.Appendf(b, "Namespace:  %s\n", r.Namespace)
-	b = fmt.Appendf(b, "Project:    %s\n", r.Project)
-	b = fmt.Appendf(b, "Sync:       %s\n", r.Sync)
-	b = fmt.Appendf(b, "Health:     %s\n", r.Health)
-	b = fmt.Appendf(b, "Revision:   %s\n", r.Revision)
-	b = fmt.Appendf(b, "Repo:       %s\n", r.Repo)
-	b = fmt.Appendf(b, "Age:        %s\n", r.AgeString())
-	b = fmt.Appendf(b, "Suspended:  %v\n", r.Suspended)
-	if r.Message != "" {
-		b = fmt.Appendf(b, "Message:    %s\n", r.Message)
+	line := func(k, v string) {
+		if v != "" && v != "-" {
+			b = fmt.Appendf(b, "%-14s%s\n", k+":", v)
+		}
 	}
+	section := func(title string) { b = fmt.Appendf(b, "\n%s:\n", title) }
+	item := func(format string, a ...any) { b = fmt.Appendf(b, "  • "+format+"\n", a...) }
+	var obj map[string]any
+	if r.Raw != nil {
+		obj = r.Raw.Object
+	}
+	str := func(m map[string]any, path ...string) string {
+		v, _, _ := unstructured.NestedString(m, path...)
+		return v
+	}
+
+	line("Kind", string(r.Kind))
+	line("Name", r.Name)
+	line("Namespace", r.Namespace)
+	line("Age", r.AgeString())
+
+	switch r.Kind {
+	case KindApplication:
+		line("Project", r.Project)
+		line("AppSet", r.Owner)
+		line("Sync", r.Sync)
+		line("Health", r.Health)
+		line("Revision", r.Revision)
+		line("Message", r.Message)
+		dest := str(obj, "spec", "destination", "server")
+		if dest == "" {
+			dest = str(obj, "spec", "destination", "name")
+		}
+		section("Destination")
+		item("cluster %s  namespace %s", orDash(dest), orDash(str(obj, "spec", "destination", "namespace")))
+		section("Sources")
+		srcs, _, _ := unstructured.NestedSlice(obj, "spec", "sources")
+		if src, ok, _ := unstructured.NestedMap(obj, "spec", "source"); ok {
+			srcs = append([]any{src}, srcs...)
+		}
+		for _, s := range srcs {
+			if m, ok := s.(map[string]any); ok {
+				path := str(m, "path")
+				if path == "" {
+					path = "chart " + str(m, "chart")
+				}
+				item("%s  %s  @%s", str(m, "repoURL"), path, orDash(str(m, "targetRevision")))
+			}
+		}
+		section("Sync policy")
+		if auto, ok, _ := unstructured.NestedMap(obj, "spec", "syncPolicy", "automated"); ok {
+			item("automated  prune=%v  selfHeal=%v", auto["prune"] == true, auto["selfHeal"] == true)
+		} else {
+			item("manual")
+		}
+		if op, ok, _ := unstructured.NestedMap(obj, "status", "operationState"); ok {
+			section("Last sync")
+			item("%s  rev %s  %s → %s", orDash(str(op, "phase")), orDash(shortRev(str(op, "syncResult", "revision"))), orDash(str(op, "startedAt")), orDash(str(op, "finishedAt")))
+			for _, l := range wrapWords(str(op, "message"), 88) {
+				b = fmt.Appendf(b, "      %s\n", l)
+			}
+			// Per-resource failures — the error list the Argo CD UI shows under "Sync status".
+			res, _, _ := unstructured.NestedSlice(op, "syncResult", "resources")
+			for _, x := range res {
+				m, ok := x.(map[string]any)
+				if !ok || str(m, "status") == "Synced" || str(m, "status") == "" {
+					continue
+				}
+				item("%s %s/%s: %s", str(m, "status"), str(m, "kind"), str(m, "name"), str(m, "message"))
+			}
+		}
+		if hist, _, _ := unstructured.NestedSlice(obj, "status", "history"); len(hist) > 0 {
+			section(fmt.Sprintf("Sync history (%d, newest first)", len(hist)))
+			for i := len(hist) - 1; i >= 0; i-- {
+				m, ok := hist[i].(map[string]any)
+				if !ok {
+					continue
+				}
+				id, _, _ := unstructured.NestedFieldNoCopy(m, "id")
+				item("#%v  %s  rev %s", id, orDash(str(m, "deployedAt")), orDash(shortRev(str(m, "revision"))))
+			}
+		}
+	case KindApplicationSet:
+		line("Project", r.Project)
+		line("Status", r.Sync)
+		line("Message", r.Message)
+		section("Generators")
+		gens, _, _ := unstructured.NestedSlice(obj, "spec", "generators")
+		for _, g := range gens {
+			if m, ok := g.(map[string]any); ok {
+				for k := range m {
+					item("%s", k)
+				}
+			}
+		}
+		section("Template")
+		item("project %s", orDash(str(obj, "spec", "template", "spec", "project")))
+		item("repo %s", orDash(r.Repo))
+		item("destination namespace %s", orDash(str(obj, "spec", "template", "spec", "destination", "namespace")))
+	case KindAppProject:
+		line("Description", r.Message)
+		section("Source repos")
+		repos, _, _ := unstructured.NestedStringSlice(obj, "spec", "sourceRepos")
+		for _, s := range repos {
+			item("%s", s)
+		}
+		section("Destinations")
+		dests, _, _ := unstructured.NestedSlice(obj, "spec", "destinations")
+		for _, d := range dests {
+			if m, ok := d.(map[string]any); ok {
+				srv := str(m, "server")
+				if srv == "" {
+					srv = str(m, "name")
+				}
+				item("cluster %s  namespace %s", orDash(srv), orDash(str(m, "namespace")))
+			}
+		}
+	}
+
 	if len(r.Conditions) > 0 {
-		b = fmt.Appendf(b, "\nApplication conditions (%d):\n", len(r.Conditions))
+		section(fmt.Sprintf("Conditions (%d)", len(r.Conditions)))
 		for _, c := range r.Conditions {
 			typ := c.Type
 			if typ == "" {
 				typ = "?"
 			}
-			b = fmt.Appendf(b, "  • %s\n", typ)
-			if c.Message != "" {
-				for _, line := range wrapWords(c.Message, 88) {
-					b = fmt.Appendf(b, "      %s\n", line)
-				}
+			item("%s", typ)
+			for _, l := range wrapWords(c.Message, 88) {
+				b = fmt.Appendf(b, "      %s\n", l)
 			}
 		}
 	}
 	return string(b)
+}
+
+func shortRev(s string) string {
+	if len(s) > 7 {
+		return s[:7]
+	}
+	return s
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func wrapWords(s string, width int) []string {
