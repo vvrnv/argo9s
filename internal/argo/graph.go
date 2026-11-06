@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 
 	"github.com/vvrnv/argo9s/internal/kube"
 )
@@ -524,7 +524,7 @@ func deploymentTree(ctx context.Context, client *kube.Client, ns, name string) (
 			out = append(out, liveNode{
 				Kind: "ReplicaSet", Name: rs.Name, Namespace: ns,
 				Health: rsHealth(rs), Status: "Synced",
-				Meta: fmt.Sprintf("%d/%d", rs.Status.ReadyReplicas, derefInt32(rs.Spec.Replicas)),
+				Meta:     fmt.Sprintf("%d/%d", rs.Status.ReadyReplicas, derefInt32(rs.Spec.Replicas)),
 				Children: pods,
 			})
 		}
