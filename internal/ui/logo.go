@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -19,7 +18,7 @@ var logoLines = []string{
 }
 
 func renderLogo(subtitle string) string {
-	style := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+	style := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 	sub := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	lines := make([]string, 0, len(logoLines)+1)
 	for _, l := range logoLines {
@@ -34,16 +33,9 @@ func renderLogo(subtitle string) string {
 }
 
 func renderLogoCompact(subtitle string) string {
-	brand := lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Render("argo9s")
+	brand := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true).Render("argo9s")
 	if subtitle == "" {
 		return brand
 	}
 	return brand + "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(subtitle)
-}
-
-func logoSubtitle(appVersion, argoHint string) string {
-	if argoHint != "" {
-		return fmt.Sprintf("%s  %s", argoHint, appVersion)
-	}
-	return appVersion
 }
